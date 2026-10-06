@@ -47,7 +47,13 @@ export default function EntryGate({
   }
 
   return (
-    <div className="flex min-h-full flex-1 flex-col items-center justify-center gap-8 bg-zinc-950 p-6 text-zinc-100">
+    <div
+      className="flex min-h-full flex-1 flex-col items-center justify-center gap-8 bg-zinc-950 p-6 text-zinc-100"
+      style={{
+        paddingTop: "max(1.5rem, env(safe-area-inset-top))",
+        paddingBottom: "max(1.5rem, env(safe-area-inset-bottom))",
+      }}
+    >
       <div className="text-center">
         <h1 className="text-4xl font-bold tracking-tight">Pulse</h1>
         <p className="mt-2 max-w-sm text-zinc-400">
@@ -58,7 +64,7 @@ export default function EntryGate({
       <button
         onClick={enter}
         disabled={status === "locating"}
-        className="rounded-full bg-emerald-400 px-8 py-3 font-semibold text-zinc-950 transition hover:bg-emerald-300 disabled:opacity-60"
+        className="min-h-11 rounded-full bg-emerald-400 px-8 font-semibold text-zinc-950 transition hover:bg-emerald-300 disabled:opacity-60"
       >
         {status === "locating" ? "Locating…" : "Enter Pulse"}
       </button>

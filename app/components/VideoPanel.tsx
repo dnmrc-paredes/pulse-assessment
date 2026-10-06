@@ -34,6 +34,7 @@ export default function VideoPanel({
           ref={remoteRef}
           autoPlay
           playsInline
+          aria-label="Stranger's video"
           className="h-full w-full bg-zinc-900 object-cover"
         />
         {!remoteStream && (
@@ -47,13 +48,21 @@ export default function VideoPanel({
           autoPlay
           playsInline
           muted
-          className="absolute bottom-4 right-4 h-40 w-28 rounded-lg border border-zinc-700 bg-zinc-800 object-cover"
+          aria-label="Your camera"
+          className="absolute h-32 w-24 rounded-lg border border-zinc-700 bg-zinc-800 object-cover sm:h-40 sm:w-28"
+          style={{
+            bottom: "max(1rem, env(safe-area-inset-bottom))",
+            right: "max(1rem, env(safe-area-inset-right))",
+          }}
         />
       </div>
-      <div className="flex justify-center bg-zinc-950 p-4">
+      <div
+        className="flex justify-center bg-zinc-950 px-4 pt-4"
+        style={{ paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}
+      >
         <button
           onClick={onEnd}
-          className="rounded-full bg-red-500 px-8 py-3 font-semibold text-white hover:bg-red-400"
+          className="min-h-11 rounded-full bg-red-500 px-8 font-semibold text-white hover:bg-red-400"
         >
           End video
         </button>

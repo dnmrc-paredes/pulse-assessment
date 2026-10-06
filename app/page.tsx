@@ -61,15 +61,34 @@ export default function Home() {
     setSession(c);
   };
 
-  // Mirrors myLocation so async handlers (re-join) can read it without
-  // depending on a stale render closure.
-  const [myLocation, setMyLocation] = useState<{ lat: number; lng: number } | null>(
-    null,
-  );
+  // The raw GPS fix, kept in a ref only: async handlers (silent re-join) need
+  // to re-register without depending on a stale render closure, and nothing
+  // renders from it any more.
   const myLocationRef = useRef<{ lat: number; lng: number } | null>(null);
+
+  // Where the server actually placed us, i.e. after the 1-3 km privacy offset.
+  // This is what peers see, so it is what our own marker must be drawn at —
+  // drawing it at the raw GPS fix made the map misrepresent our position.
+  const [publishedLocation, setPublishedLocation] = useState<{
+    lat: number;
+    lng: number;
+  } | null>(null);
+
+  // False until the first poll succeeds, so the map can say "checking" rather
+  // than "nobody is here" before it has actually checked.
+  const [presenceLoaded, setPresenceLoaded] = useState(false);
+
+  // Brief, one-shot acknowledgement that the handshake succeeded. This is the
+  // moment the app used to give no signal at all about.
+  const [justConnected, setJustConnected] = useState(false);
+
+  // Remote typing indicator. Auto-expires, because a peer who closes the tab
+  // mid-sentence never sends a "stopped" message.
+  const [peerTyping, setPeerTyping] = useState(false);
+  const typingExpiry = useRef<number | null>(null);
+  const lastSentTyping = useRef(false);
   const setLocation = (loc: { lat: number; lng: number } | null) => {
     myLocationRef.current = loc;
-    setMyLocation(loc);
   };
 
   const [conn, _setConn] = useState<Conn>({ kind: "idle" });
@@ -91,14 +110,28 @@ export default function Home() {
   const connTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const incomingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const noticeTimer = useRef<number | null>(null);
+  const noticeQueue = useRef<string[]>([]);
   const rejoinsRef = useRef(0);
 
+  // Notices are queued rather than replaced. Connection teardown emits several
+  // in quick succession ("Request declined." then "Stranger disconnected."), and
+  // the old behaviour silently dropped all but the last one.
   function showNotice(text: string) {
-    setNotice(text);
-    // Clear the previous dismissal first: overlapping notices used to race, so
-    // an earlier timer could hide a newer message early.
-    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
-    noticeTimer.current = window.setTimeout(() => setNotice(null), 3500);
+    noticeQueue.current = [...noticeQueue.current, text];
+    if (noticeTimer.current) return; // already draining
+    const advance = () => {
+      const [next, ...rest] = noticeQueue.current;
+      noticeQueue.current = rest;
+      setNotice(next ?? null);
+      noticeTimer.current =
+        next === undefined
+          ? null
+          : window.setTimeout(() => {
+              noticeTimer.current = null;
+              advance();
+            }, 3500);
+    };
+    advance();
   }
 
   // Every signal send funnels through here so failures are visible and auth is
@@ -163,6 +196,7 @@ export default function Home() {
     setRemoteStream(null);
     setVideo("none");
     setMessages([]);
+    setPeerTyping(false);
     setConn({ kind: "idle" });
     if (message) showNotice(message);
   }
@@ -193,6 +227,7 @@ export default function Home() {
       },
       onChat: (text) => addMessage(false, text),
       onControl: (ctrl) => handleControl(ctrl),
+      onTyping: (isTyping) => handleTyping(isTyping),
       onRemoteStream: (stream) => setRemoteStream(stream),
       onConnectionState: (state) => {
         traceEvent("pc connectionState:", state);
@@ -205,9 +240,19 @@ export default function Home() {
         // The handshake completed, so the connect deadline no longer applies.
         if (connTimer.current) clearTimeout(connTimer.current);
         setConn({ kind: "connected", peerId });
+        setJustConnected(true);
+        window.setTimeout(() => setJustConnected(false), 1400);
       },
     });
     peerRef.current = ps;
+  }
+
+  function handleTyping(isTyping: boolean) {
+    if (typingExpiry.current) window.clearTimeout(typingExpiry.current);
+    setPeerTyping(isTyping);
+    if (isTyping) {
+      typingExpiry.current = window.setTimeout(() => setPeerTyping(false), 4000);
+    }
   }
 
   function handleControl(ctrl: PeerControl) {
@@ -434,6 +479,8 @@ export default function Home() {
         const data = await poll(token, connRef.current.kind !== "idle");
         if (!active) return;
         setPeers(data.peers);
+        setPresenceLoaded(true);
+        if (data.me) setPublishedLocation(data.me);
         for (const s of data.signals) processSignalRef.current(s);
         rejoinsRef.current = 0;
       } catch (err) {
@@ -490,13 +537,33 @@ export default function Home() {
     <main className="fixed inset-0 overflow-hidden">
       <WorldMap
         peers={peers}
-        me={myLocation}
+        me={publishedLocation}
         onPeerClick={requestConnection}
         canConnect={conn.kind === "idle"}
+        compact={inChat}
+        presenceState={
+          !presenceLoaded ? "loading" : peers.length === 0 ? "empty" : "populated"
+        }
       />
 
+      {/* Connection flourish. Purely decorative, so it is hidden from assistive
+          tech; the header status change already carries that information. */}
+      {justConnected && (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center"
+        >
+          <div className="connect-flash rounded-full border-2 border-emerald-400" />
+        </div>
+      )}
+
       {notice && (
-        <div className="absolute left-1/2 top-20 z-30 -translate-x-1/2 rounded-full bg-zinc-800/90 px-4 py-2 text-sm text-zinc-100 shadow-lg backdrop-blur">
+        <div
+          className="absolute left-1/2 top-20 z-30 max-w-[calc(100%-2rem)] -translate-x-1/2 rounded-full bg-zinc-800/90 px-4 py-2 text-center text-sm text-zinc-100 shadow-lg backdrop-blur"
+          style={{ top: "max(5rem, calc(env(safe-area-inset-top) + 4rem))" }}
+          role="status"
+          aria-live="polite"
+        >
           {notice}
         </div>
       )}
@@ -528,7 +595,21 @@ export default function Home() {
           messages={messages}
           connected={conn.kind === "connected"}
           videoBusy={video !== "none"}
+          peerTyping={peerTyping}
+          onDraftChange={(text) => {
+            // Only announce transitions, so holding a key does not flood the
+            // channel with one message per keystroke.
+            const next = text.trim().length > 0;
+            if (next !== lastSentTyping.current) {
+              lastSentTyping.current = next;
+              peerRef.current?.sendTyping(next);
+            }
+          }}
           onSend={(text) => {
+            if (lastSentTyping.current) {
+              lastSentTyping.current = false;
+              peerRef.current?.sendTyping(false);
+            }
             peerRef.current?.sendChat(text);
             addMessage(true, text);
           }}
@@ -549,6 +630,7 @@ export default function Home() {
           subtitle="The stranger wants to turn on video."
           acceptLabel="Accept"
           declineLabel="Decline"
+          tone="video"
           onAccept={acceptVideo}
           onDecline={declineVideo}
         />

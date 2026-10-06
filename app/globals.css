@@ -22,27 +22,59 @@
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  /* Geist first, with system fallbacks. Previously this was hardcoded to Arial,
+     which silently overrode the font loaded in layout.tsx and made the
+     --font-sans theme variable dead. */
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
 
-/* Live user dots on the map */
+/* Live user dots on the map.
+
+   The button is a 44px square so the primary interaction of the whole app is
+   reachable with a thumb (Apple HIG and Material both specify 44-48px). The
+   visible dot is drawn inside it at 14px via ::after, so the larger hit area
+   does not make the dot itself look bloated. The per-peer colour is set as a
+   custom property by WorldMap. */
 .pulse-dot {
+  width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  /* Suppress the default focus ring in favour of a visible one below. */
+  outline: none;
+}
+
+.pulse-dot::after {
+  content: "";
   width: 14px;
   height: 14px;
   border-radius: 9999px;
   border: 2px solid rgba(255, 255, 255, 0.9);
-  cursor: pointer;
-  padding: 0;
-  box-shadow: 0 0 0 rgba(255, 255, 255, 0.5);
-  animation: pulse-ring 2s ease-out infinite;
-  transition: transform 0.1s ease;
+  background: var(--dot-color, #34d399);
+  transition: transform 0.12s ease;
 }
 
-.pulse-dot:hover {
-  transform: scale(1.3);
+.pulse-dot:hover::after,
+.pulse-dot:focus-visible::after {
+  transform: scale(1.35);
 }
 
-/* The user's own "you are here" pin — small, sized like the dots. */
+.pulse-dot:focus-visible::after {
+  box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.9);
+}
+
+/* Busy peers (already in a connection) are dimmed. */
+.pulse-dot[data-busy="true"]::after {
+  opacity: 0.35;
+}
+
+/* The user's own "you are here" pin — drawn at the position the server
+   published, not the raw GPS fix, so it matches what peers actually see. */
 .pulse-me {
   position: relative;
   font-size: 18px;
@@ -66,6 +98,48 @@ body {
   white-space: nowrap;
 }
 
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.5;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@keyframes connect-flash {
+  0% {
+    transform: scale(0.35);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+}
+
+@keyframes conn-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-breathe {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 1;
+  }
+}
+
 @keyframes pulse-ring {
   0% {
     box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.4);
@@ -75,5 +149,86 @@ body {
   }
   100% {
     box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
+  }
+}
+
+/* Empty / loading state indicator on the map. The loader breathes while we are
+   still checking; the idle state keeps a faint static halo so the card does not
+   look broken once we know we are genuinely waiting for someone. */
+.pulse-loader {
+  border-top-color: transparent;
+}
+
+/* Three-dot typing indicator. */
+.typing-dots {
+  display: inline-flex;
+  gap: 2px;
+  align-items: flex-end;
+  height: 8px;
+}
+
+.typing-dots i {
+  width: 3px;
+  height: 3px;
+  border-radius: 9999px;
+  background: currentColor;
+}
+
+/* One-shot ring that expands out from the centre when the data channel opens.
+   Decorative reinforcement for a moment that previously had no feedback. */
+.connect-flash {
+  width: 120px;
+  height: 120px;
+  animation: connect-flash 1.4s ease-out forwards;
+}
+
+/* Inline spinner for the "connecting" state in the chat header. */
+.conn-spinner {
+  animation: conn-spin 0.7s linear infinite;
+}
+
+.pulse-idle {
+  opacity: 0.6;
+}
+
+/* The ring is what makes the map feel alive, but an endless animation on every
+   dot is a real accessibility problem (WCAG 2.3.3) and burns battery on
+   mobile. Only run it when the user has not asked for reduced motion. */
+@media (prefers-reduced-motion: no-preference) {
+  .pulse-dot::after {
+    animation: pulse-ring 2s ease-out infinite;
+  }
+  .pulse-loader {
+    animation: pulse-breathe 1.6s ease-in-out infinite;
+  }
+  .conn-spinner {
+    animation: conn-spin 0.7s linear infinite;
+  }
+  .connect-flash {
+    animation: connect-flash 1.4s ease-out forwards;
+  }
+  .typing-dots i {
+    animation: typing-bounce 1.2s ease-in-out infinite;
+  }
+  .typing-dots i:nth-child(2) {
+    animation-delay: 0.15s;
+  }
+  .typing-dots i:nth-child(3) {
+    animation-delay: 0.3s;
+  }
+}
+
+/* Under reduced motion, keep a static halo so a dot is still distinguishable
+   from the background, and drop the hover scale. */
+@media (prefers-reduced-motion: reduce) {
+  .pulse-loader {
+    opacity: 0.6;
+  }
+  .pulse-dot::after {
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.35);
+  }
+  .pulse-dot:hover::after,
+  .pulse-dot:focus-visible::after {
+    transform: none;
   }
 }
