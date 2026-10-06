@@ -5,19 +5,22 @@ export type PeerControl =
   | "video-request"
   | "video-accept"
   | "video-decline"
-  | "video-end";
+  | "video-end"
+  | "typing";
 
 // Single source of truth for the data-channel wire format. The sender and the
 // receiver both derive from this union, so a mismatched discriminant is a
 // compile error rather than a silently dropped message.
 type ChannelMsg =
   | { t: "chat"; text: string }
-  | { t: "ctrl"; ctrl: PeerControl };
+  | { t: "ctrl"; ctrl: PeerControl }
+  | { t: "typing"; typing: boolean };
 
 interface PeerCallbacks {
   onSignal: (type: DescType, payload: string) => void;
   onChat: (text: string) => void;
   onControl: (ctrl: PeerControl) => void;
+  onTyping: (isTyping: boolean) => void;
   onRemoteStream: (stream: MediaStream | null) => void;
   onConnectionState: (state: RTCPeerConnectionState) => void;
   onChannelOpen: () => void;
@@ -174,6 +177,8 @@ export class PeerSession {
         this.cb.onChat(msg.text);
       } else if (msg.t === "ctrl" && typeof msg.ctrl === "string") {
         this.cb.onControl(msg.ctrl as PeerControl);
+      } else if (msg.t === "typing" && typeof msg.typing === "boolean") {
+        this.cb.onTyping(msg.typing);
       }
     };
   }
@@ -287,6 +292,13 @@ export class PeerSession {
 
   sendControl(ctrl: PeerControl) {
     this.safeSend({ t: "ctrl", ctrl } satisfies ChannelMsg);
+  }
+
+  // Typing is a control message rather than a chat message so it never lands in
+  // the transcript, and it rides the existing peer-to-peer channel, so it costs
+  // nothing on the server.
+  sendTyping(isTyping: boolean) {
+    this.safeSend({ t: "typing", typing: isTyping } satisfies ChannelMsg);
   }
 
   private safeSend(obj: ChannelMsg) {
