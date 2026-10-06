@@ -5,6 +5,7 @@
 // level. It is duplicated here rather than imported from @prisma/client so that
 // client components don't pull the Prisma client into the browser bundle.
 export type SignalType =
+  | "wave" // low-commitment greeting; no connection implied
   | "request" // connection request (tap a dot)
   | "accept" // recipient accepted
   | "decline" // recipient declined (or auto-declined while busy)

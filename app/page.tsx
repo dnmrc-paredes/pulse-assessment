@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import EntryGate from "./components/EntryGate";
 import WorldMap from "./components/WorldMap";
 import ConnectionPrompt from "./components/ConnectionPrompt";
@@ -16,6 +16,16 @@ import {
 } from "@/lib/api";
 import { PeerSession, type DescType, type PeerControl } from "@/lib/webrtc";
 import { POLL_INTERVAL_MS } from "@/lib/presence";
+import { distanceBand, haversineKm, type DistanceBand } from "@/lib/distance";
+import { estimatedLocalTime } from "@/lib/localtime";
+import { pickStarter, type Starter } from "@/lib/icebreakers";
+import ReachCard from "./components/ReachCard";
+import {
+  describeNetwork,
+  initialNetwork,
+  type NetworkSnapshot,
+} from "@/lib/netstatus";
+import * as blockedStore from "@/lib/blocked";
 import { type PeerDot, type SignalMsg, type SignalType } from "@/lib/types";
 import { trace, traceEvent } from "@/lib/debug";
 
@@ -74,6 +84,23 @@ export default function Home() {
     lng: number;
   } | null>(null);
 
+  // Distance band per peer, computed once here rather than in each component
+  // that needs it, so the dot colour, the reach card and the chat header can
+  // never disagree about how far away someone is.
+  const peerBands = useMemo(() => {
+    const map = new Map<string, DistanceBand>();
+    if (!publishedLocation) return map;
+    for (const peer of peers) {
+      map.set(
+        peer.id,
+        distanceBand(
+          haversineKm(publishedLocation, { lat: peer.lat, lng: peer.lng }),
+        ),
+      );
+    }
+    return map;
+  }, [peers, publishedLocation]);
+
   // False until the first poll succeeds, so the map can say "checking" rather
   // than "nobody is here" before it has actually checked.
   const [presenceLoaded, setPresenceLoaded] = useState(false);
@@ -82,11 +109,45 @@ export default function Home() {
   // moment the app used to give no signal at all about.
   const [justConnected, setJustConnected] = useState(false);
 
+  // Reach context, shown once when a connection first opens.
+  const [reach, setReach] = useState<{
+    peerId: string;
+    band: DistanceBand;
+    localTime: ReturnType<typeof estimatedLocalTime>;
+    starter: Starter;
+  } | null>(null);
+  const starterSeq = useRef(0);
+  const lastStarter = useRef("");
+
+  // Session-scoped block list, held in memory only. See lib/blocked.ts for why
+  // it is deliberately not persisted.
+  const blockedPeers = useSyncExternalStore(
+    blockedStore.subscribe,
+    blockedStore.getSnapshot,
+    blockedStore.getServerSnapshot,
+  );
+
+  // Read by the channel-open callback, which is bound once per PeerSession.
+  const peerBandsRef = useRef(peerBands);
+  const peerLngRef = useRef(new Map<string, number>());
+  useEffect(() => {
+    peerBandsRef.current = peerBands;
+    peerLngRef.current = new Map(peers.map((p) => [p.id, p.lng]));
+  }, [peerBands, peers]);
+
   // Remote typing indicator. Auto-expires, because a peer who closes the tab
   // mid-sentence never sends a "stopped" message.
   const [peerTyping, setPeerTyping] = useState(false);
+
+  // Real ICE/gathering state, so a stall is legible instead of guessing.
+  const [network, setNetwork] = useState<NetworkSnapshot>(initialNetwork);
+  const networkRef = useRef(network);
+  useEffect(() => {
+    networkRef.current = network;
+  });
   const typingExpiry = useRef<number | null>(null);
   const lastSentTyping = useRef(false);
+  const wavedAtRef = useRef<number>(0);
   const setLocation = (loc: { lat: number; lng: number } | null) => {
     myLocationRef.current = loc;
   };
@@ -197,6 +258,8 @@ export default function Home() {
     setVideo("none");
     setMessages([]);
     setPeerTyping(false);
+    setReach(null);
+    setNetwork(initialNetwork());
     setConn({ kind: "idle" });
     if (message) showNotice(message);
   }
@@ -229,10 +292,20 @@ export default function Home() {
       onControl: (ctrl) => handleControl(ctrl),
       onTyping: (isTyping) => handleTyping(isTyping),
       onRemoteStream: (stream) => setRemoteStream(stream),
+      onNetwork: (snapshot) => setNetwork(snapshot),
       onConnectionState: (state) => {
         traceEvent("pc connectionState:", state);
         if (state === "failed" || state === "closed") {
-          teardown("Connection failed (network).");
+          // Prefer the ICE-level explanation over a generic "network" string,
+          // since it can say whether the route was blocked or merely died.
+          const verdict = describeNetwork(networkRef.current);
+          const reason =
+            verdict.kind === "blocked"
+              ? verdict.hint
+              : verdict.kind === "degraded"
+                ? verdict.message
+                : "The connection couldn't be completed.";
+          teardown(`${verdict.kind === "blocked" ? verdict.message : "Connection lost."} ${reason}`);
         }
       },
       onChannelOpen: () => {
@@ -242,6 +315,22 @@ export default function Home() {
         setConn({ kind: "connected", peerId });
         setJustConnected(true);
         window.setTimeout(() => setJustConnected(false), 1400);
+
+        // Reach context, once per connection. Guarded on the peer id so a
+        // renegotiation (adding video tracks fires another offer round) cannot
+        // re-trigger it.
+        setReach((prev) => {
+          if (prev?.peerId === peerId) return prev;
+          const band = peerBandsRef.current.get(peerId) ?? "far";
+          const starter = pickStarter(starterSeq.current++, lastStarter.current);
+          lastStarter.current = starter.text;
+          return {
+            peerId,
+            band,
+            localTime: estimatedLocalTime(peerLngRef.current.get(peerId) ?? 0),
+            starter,
+          };
+        });
       },
     });
     peerRef.current = ps;
@@ -290,8 +379,44 @@ export default function Home() {
     }
   }
 
+  // Wave state: an outgoing wave (so you can see it left) and an incoming one
+  // (so the other side sees it land). Both clear themselves.
+  const [waving, setWaving] = useState<string | null>(null);
+  const [wavedAt, setWavedAt] = useState<{ peerId: string; key: number } | null>(null);
+
+  function sendWave(peerId: string) {
+    if (connRef.current.kind !== "idle") {
+      showNotice("Finish what you're doing first.");
+      return;
+    }
+    if (blockedStore.isBlocked(peerId)) {
+      showNotice("You blocked that person.");
+      return;
+    }
+    void signal(peerId, "wave");
+    setWaving(peerId);
+    window.setTimeout(() => setWaving((cur) => (cur === peerId ? null : cur)), 1600);
+  }
+
+  function handleIncomingWave(peerId: string) {
+    const key = Date.now();
+    wavedAtRef.current = key;
+    setWavedAt({ peerId, key });
+    window.setTimeout(
+      () => setWavedAt((cur) => (cur?.key === wavedAtRef.current ? null : cur)),
+      9000,
+    );
+  }
+
   function requestConnection(peerId: string) {
     if (connRef.current.kind !== "idle") return;
+    // Tapping a blocked dot unblocks rather than connects, so blocking is never
+    // a one-way door within a session.
+    if (blockedStore.isBlocked(peerId)) {
+      blockedStore.remove(peerId);
+      showNotice("Unblocked. Tap again to connect.");
+      return;
+    }
     setConn({ kind: "requesting", peerId });
     void signal(peerId, "request");
     connTimer.current = setTimeout(() => {
@@ -340,6 +465,12 @@ export default function Home() {
     setConn({ kind: "idle" });
   }
 
+  function blockAndEnd(peerId: string) {
+    blockedStore.add(peerId);
+    void signal(peerId, "end");
+    teardown("Blocked. You won't be connected to them again.");
+  }
+
   function endConnection() {
     const c = connRef.current;
     if (c.kind === "connecting" || c.kind === "connected") {
@@ -386,7 +517,24 @@ export default function Home() {
 
   function processSignal(sig: SignalMsg) {
     trace("<-", sig.type, sig.fromId, undefined, sig.payload?.length ?? 0);
+
+    // Signals from a blocked session are discarded before they reach any state
+    // machine. `end` still gets through so that blocking someone mid-call tears
+    // the connection down cleanly rather than leaving it hanging.
+    if (blockedStore.isBlocked(sig.fromId) && sig.type !== "end") {
+      // Auto-decline so the blocked party is not left waiting on a prompt that
+      // will never appear.
+      if (sig.type === "request") void signal(sig.fromId, "decline");
+      return;
+    }
+
     switch (sig.type) {
+      case "wave": {
+        // A wave commits nobody to anything: no prompt, no busy lease, and no
+        // state change beyond the ripple on the map.
+        if (connRef.current.kind === "idle") handleIncomingWave(sig.fromId);
+        break;
+      }
       case "request": {
         if (connRef.current.kind === "idle") {
           setConn({ kind: "incoming", peerId: sig.fromId });
@@ -539,11 +687,16 @@ export default function Home() {
         peers={peers}
         me={publishedLocation}
         onPeerClick={requestConnection}
+        onWave={sendWave}
+        wavingPeerId={waving}
+        wavedPeerId={wavedAt?.peerId ?? null}
         canConnect={conn.kind === "idle"}
         compact={inChat}
         presenceState={
           !presenceLoaded ? "loading" : peers.length === 0 ? "empty" : "populated"
         }
+        bands={peerBands}
+        blockedPeers={blockedPeers}
       />
 
       {/* Connection flourish. Purely decorative, so it is hidden from assistive
@@ -554,6 +707,63 @@ export default function Home() {
           className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center"
         >
           <div className="connect-flash rounded-full border-2 border-emerald-400" />
+        </div>
+      )}
+
+      {reach && video === "none" && (
+        <ReachCard
+          band={reach.band}
+          localTime={reach.localTime}
+          starter={reach.starter}
+          onDismiss={() => setReach(null)}
+        />
+      )}
+
+      {/* Wave-back offer. A wave commits nobody to anything, so the reply has
+          to stay as low-commitment as the greeting. */}
+      {wavedAt && conn.kind === "idle" && video === "none" && (
+        <div
+          className="wave-in absolute inset-x-0 z-20 flex justify-center px-4"
+          style={{
+            top: "max(3.5rem, calc(env(safe-area-inset-top) + 3.5rem))",
+          }}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-950/95 py-1.5 pl-3 pr-1.5 text-sm text-zinc-200 shadow-xl backdrop-blur">
+            <span aria-hidden="true">👋</span>
+            <span>Someone waved at you</span>
+            <button
+              type="button"
+              onClick={() => {
+                const target = wavedAt.peerId;
+                setWavedAt(null);
+                sendWave(target);
+              }}
+              className="min-h-9 rounded-full bg-zinc-800 px-3 text-xs text-zinc-100 hover:bg-zinc-700"
+            >
+              Wave back
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const target = wavedAt.peerId;
+                setWavedAt(null);
+                requestConnection(target);
+              }}
+              className="min-h-9 rounded-full bg-emerald-400 px-3 text-xs font-semibold text-zinc-950 hover:bg-emerald-300"
+            >
+              Connect
+            </button>
+            <button
+              type="button"
+              onClick={() => setWavedAt(null)}
+              aria-label="Dismiss"
+              className="flex h-9 w-9 items-center justify-center rounded-full text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              <span aria-hidden="true">&times;</span>
+            </button>
+          </div>
         </div>
       )}
 
@@ -596,6 +806,20 @@ export default function Home() {
           connected={conn.kind === "connected"}
           videoBusy={video !== "none"}
           peerTyping={peerTyping}
+          networkMessage={
+            inChat && conn.kind === "connecting"
+              ? (() => {
+                  const v = describeNetwork(network);
+                  return v.kind === "progress" ? v.message : "Connecting…";
+                })()
+              : null
+          }
+          peerBand={inChat ? peerBands.get(conn.peerId) ?? null : null}
+          peerLocalTime={
+            inChat && conn.peerId !== undefined
+              ? estimatedLocalTime(peerLngRef.current.get(conn.peerId) ?? 0)
+              : null
+          }
           onDraftChange={(text) => {
             // Only announce transitions, so holding a key does not flood the
             // channel with one message per keystroke.
@@ -615,6 +839,7 @@ export default function Home() {
           }}
           onStartVideo={startVideoRequest}
           onEnd={endConnection}
+          onBlock={() => blockAndEnd(conn.peerId)}
         />
       )}
 

@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { MAX_CHAT_CHARS } from "@/lib/validate";
+import { BAND_LABEL, type DistanceBand } from "@/lib/distance";
+import type { EstimatedLocalTime } from "@/lib/localtime";
 
 export interface ChatMessage {
   id: number;
@@ -14,19 +16,30 @@ export default function ChatPanel({
   connected,
   videoBusy,
   peerTyping,
+  peerBand,
+  peerLocalTime,
+  networkMessage,
   onDraftChange,
   onSend,
   onStartVideo,
   onEnd,
+  onBlock,
 }: {
   messages: ChatMessage[];
   connected: boolean;
   videoBusy: boolean;
   peerTyping: boolean;
+  // Persistent reach context, so who you are talking to stays visible after
+  // the transient card has gone.
+  peerBand: DistanceBand | null;
+  peerLocalTime: EstimatedLocalTime | null;
+  // Real ICE state while connecting, so the wait explains itself.
+  networkMessage: string | null;
   onDraftChange: (text: string) => void;
   onSend: (text: string) => void;
   onStartVideo: () => void;
   onEnd: () => void;
+  onBlock: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
@@ -53,11 +66,17 @@ export default function ChatPanel({
     <aside
       aria-label="Conversation with stranger"
       className="absolute inset-x-0 bottom-0 z-20 flex max-h-[75dvh] flex-col rounded-t-2xl border-t border-zinc-800 bg-zinc-950 text-zinc-100 shadow-2xl
-                 md:inset-y-0 md:left-auto md:right-0 md:max-h-none md:w-full md:max-w-md md:rounded-none md:border-t-0 md:border-l"
+                 md:inset-y-0 md:left-auto md:right-0 md:max-h-none md:w-[var(--panel-w)] md:rounded-none md:border-t-0 md:border-l"
     >
       <header className="flex items-center justify-between gap-2 border-b border-zinc-800 px-4 py-3">
         <div className="min-w-0">
           <p className="truncate font-semibold">Stranger</p>
+          {peerBand && (
+            <p className="truncate text-xs text-zinc-500">
+              {BAND_LABEL[peerBand]}
+              {peerLocalTime ? ` · ${peerLocalTime.label.replace(" where they are", "")}` : ""}
+            </p>
+          )}
           {/* The handshake used to go from a bare "Connecting…" straight to a
               silently-appearing chat panel, so nothing acknowledged that the
               connection actually succeeded. Live region, because the state
@@ -81,7 +100,9 @@ export default function ChatPanel({
                   aria-hidden="true"
                   className="conn-spinner inline-block h-2.5 w-2.5 rounded-full border border-zinc-500 border-t-emerald-400"
                 />
-                Connecting&hellip;
+                {/* Named state rather than a bare "Connecting…", so a stalled
+                    route reads differently from a slow one. */}
+                {networkMessage ?? "Connecting…"}
               </>
             )}
           </p>
@@ -100,6 +121,23 @@ export default function ChatPanel({
             className="min-h-11 rounded-full bg-red-500 px-4 text-sm font-medium text-white hover:bg-red-400"
           >
             End
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              if (
+                window.confirm(
+                  "Block this person? You will not be able to connect to them again in this session.",
+                )
+              ) {
+                onBlock();
+              }
+            }}
+            className="min-h-11 shrink-0 rounded-full border border-zinc-800 px-3 text-sm text-zinc-500 hover:border-zinc-600 hover:text-zinc-300"
+            aria-label="End and block this person"
+            title="End and block"
+          >
+            <span aria-hidden="true">🚫</span>
           </button>
         </div>
       </header>
@@ -152,8 +190,8 @@ export default function ChatPanel({
         aria-live="polite"
       >
         {peerTyping ? (
-          <span className="inline-flex items-center gap-1">
-            typing
+          <span className="inline-flex items-center gap-1.5">
+            Stranger is typing
             <span aria-hidden="true" className="typing-dots">
               <i />
               <i />

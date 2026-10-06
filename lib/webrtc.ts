@@ -1,4 +1,5 @@
 import { TRACE_ENABLED, traceEvent } from "@/lib/debug";
+import { initialNetwork, type NetworkSnapshot } from "@/lib/netstatus";
 
 export type DescType = "offer" | "answer" | "ice";
 export type PeerControl =
@@ -23,6 +24,7 @@ interface PeerCallbacks {
   onTyping: (isTyping: boolean) => void;
   onRemoteStream: (stream: MediaStream | null) => void;
   onConnectionState: (state: RTCPeerConnectionState) => void;
+  onNetwork: (snapshot: NetworkSnapshot) => void;
   onChannelOpen: () => void;
 }
 
@@ -80,6 +82,9 @@ export class PeerSession {
   private closed = false;
   private readonly cb: PeerCallbacks;
   private pendingCandidates: RTCIceCandidateInit[] = [];
+  // Mirrors the browser's ICE/gathering state so the UI can explain a stall
+  // instead of leaving the user on a bare "Connecting…".
+  private network: NetworkSnapshot = initialNetwork();
 
   // Serialises inbound signaling. Polling delivers signals in batches, and
   // every one of them is dispatched without awaiting the last, so descriptions
@@ -135,16 +140,39 @@ export class PeerSession {
     // The aggregate `connectionState` only says "connecting"; these three say
     // *why* a check never succeeds — whether gathering finished, which transport
     // state ICE is in, and whether a STUN/TURN server was rejected outright.
+    const publish = () => {
+      traceEvent(
+        `network: ice=${this.network.ice} gathering=${this.network.gathering} errors=${this.network.gatheringErrors}`,
+      );
+      this.cb.onNetwork(this.network);
+    };
+
     this.pc.oniceconnectionstatechange = () => {
-      traceEvent(`iceConnectionState: ${this.pc.iceConnectionState}`);
-      if (this.pc.iceConnectionState === "failed") void this.logCandidatePairs();
+      const ice = this.pc.iceConnectionState as NetworkSnapshot["ice"];
+      this.network = {
+        ...this.network,
+        ice,
+        // Sticky: once a pair has worked, a later "failed" is a dropout rather
+        // than a route that never existed, and the two warrant different words.
+        everConnected: this.network.everConnected || ice === "connected" || ice === "completed",
+      };
+      publish();
+      if (ice === "failed") void this.logCandidatePairs();
     };
     this.pc.onicegatheringstatechange = () => {
-      traceEvent(`iceGatheringState: ${this.pc.iceGatheringState}`);
+      this.network = {
+        ...this.network,
+        gathering: this.pc.iceGatheringState as NetworkSnapshot["gathering"],
+      };
+      publish();
     };
     this.pc.onicecandidateerror = (event) => {
       const e = event as unknown as { errorCode?: number; errorText?: string; address?: string };
       traceEvent(`iceCandidateError code=${e.errorCode ?? "?"} ${e.errorText ?? ""} ${e.address ?? ""}`);
+      // Each of these is a STUN or TURN server that did not answer, which is
+      // the single most useful clue when a connection never establishes.
+      this.network = { ...this.network, gatheringErrors: this.network.gatheringErrors + 1 };
+      publish();
     };
 
     if (initiator) {
