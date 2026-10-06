@@ -33,7 +33,10 @@ export async function resolveSession(token: unknown) {
   if (typeof token !== "string" || token.length !== 43) return null;
   return prisma.presence.findUnique({
     where: { tokenHash: hashToken(token) },
-    select: { id: true, busy: true, busyAt: true },
+    // lat/lng are the *published* (already privacy-offset) coordinates. The
+    // client needs these so it can draw its own marker where peers actually see
+    // it, rather than at its raw GPS fix.
+    select: { id: true, busy: true, busyAt: true, lat: true, lng: true },
   });
 }
 
