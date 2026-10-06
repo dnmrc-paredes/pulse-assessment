@@ -12,23 +12,56 @@ datasource db {
 }
 
 model Presence {
-  id       String   @id // client-generated session uuid
-  lat      Float // ALREADY privacy-offset coords (raw is never stored)
-  lng      Float
-  busy     Boolean  @default(false) // true while in an active connection
+  // Server-issued session id. This is the *public* address of a session: peers
+  // learn it (they must, to route signals) but it grants nothing on its own.
+  id String @id
+
+  // SHA-256 of the session's secret token. The token itself is never stored,
+  // so a database leak cannot be replayed as a live session. Every mutating
+  // request resolves identity by looking up this hash — never by trusting a
+  // client-supplied id.
+  tokenHash String @unique
+
+  lat Float // ALREADY privacy-offset coords (raw is never stored)
+  lng Float
+
+  // Busy is a *lease*, not a latch: busyAt is stamped when the lock is taken
+  // and refreshed by the holder while the connection is live. A lock whose
+  // busyAt has aged past BUSY_TTL_MS is reclaimed by /api/poll, so a crashed
+  // or half-closed connection can never lock a user out permanently.
+  busy   Boolean   @default(false)
+  busyAt DateTime?
+
   lastSeen DateTime
 
   @@index([lastSeen])
+  // Supports the expired-lease sweep in /api/poll.
+  @@index([busy, busyAt])
+}
+
+enum SignalType {
+  request
+  accept
+  decline
+  offer
+  answer
+  ice
+  end
 }
 
 model Signal {
   // Mailbox for connection requests + WebRTC signaling only.
-  id        String   @id @default(uuid())
+  id        String     @id @default(uuid())
   toId      String // recipient session id
   fromId    String // sender session id
-  type      String // request | accept | decline | offer | answer | ice | end
+  type      SignalType
   payload   String? // JSON string (SDP / ICE candidate)
-  createdAt DateTime @default(now())
+  createdAt DateTime   @default(now())
 
-  @@index([toId])
+  // Inbox read: "give me my signals oldest-first, live ones only".
+  @@index([toId, createdAt])
+  // /api/leave scans by sender as well as recipient.
+  @@index([fromId])
+  // Orphan reaper in /api/poll scans by age across the whole table.
+  @@index([createdAt])
 }
