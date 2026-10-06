@@ -1,6 +1,9 @@
 // Shared types across client + API.
 
-// Signal mailbox message types.
+// Signal mailbox message types. This union mirrors the `SignalType` enum in
+// prisma/schema.prisma, which is the authoritative constraint at the database
+// level. It is duplicated here rather than imported from @prisma/client so that
+// client components don't pull the Prisma client into the browser bundle.
 export type SignalType =
   | "request" // connection request (tap a dot)
   | "accept" // recipient accepted
