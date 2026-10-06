@@ -13,6 +13,10 @@
     "isolatedModules": true,
     "jsx": "react-jsx",
     "incremental": true,
+    // Node's --experimental-strip-types requires an explicit .ts extension on
+    // relative imports so the tests under tests/ can run with the built-in
+    // runner. Safe because noEmit is set.
+    "allowImportingTsExtensions": true,
     "plugins": [
       {
         "name": "next"
