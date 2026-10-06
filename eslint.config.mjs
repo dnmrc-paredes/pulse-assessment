@@ -12,6 +12,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // Vendored agent tooling, not application source. Linting these example
+    // files pulls in their own (intentional) `any` usage and breaks `npm run lint`.
+    ".agents/**",
   ]),
 ]);
 
