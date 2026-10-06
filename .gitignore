@@ -40,3 +40,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# agent tooling (vendored skill docs, not application source)
+/.agents/
+/skills-lock.json
