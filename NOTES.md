@@ -243,11 +243,162 @@ length, and unified id/token validation.
 
 ## Phase 2 — Make it good
 
-**Not started.** No UI/UX work has been done yet.
+Three tiers. The tiers share files, so they are recorded together rather than as
+separate commits — splitting them would have needed per-hunk surgery and produced
+intermediate states that do not compile.
+
+### Tier 1 — accessibility and correctness
+
+- **The Geist font was never applied.** `globals.css` hardcoded
+  `font-family: Arial`, silently overriding the font loaded in `layout.tsx` and
+  leaving the `--font-sans` theme variable dead. Confirmed in-browser with
+  `document.fonts.check('16px Geist')`.
+- **The peer dot was a 14px target**, making the primary interaction of the app
+  unusable with a thumb. Now a 44px button with the 14px dot drawn in `::after`,
+  so the larger hit area does not look bloated. Measured with
+  `getBoundingClientRect` at five real viewport sizes.
+- **`prefers-reduced-motion` was ignored**, so the pulse animation ran forever on
+  every dot. Now gated behind `no-preference` with a static fallback.
+- **`ConnectionPrompt` was not a dialog**: no `role`, no Escape, no focus
+  management, and keyboard users could Tab straight through to the map behind it.
+- **Chat had no `aria-live` region**, and who-said-what was conveyed by alignment
+  alone.
+- **The "Me" pin was drawn at the raw GPS position** rather than the published
+  offset position, so the map misrepresented where you actually appear. Fixed by
+  returning the caller's own offset coordinates from `/api/poll` (`PollResponse.me`)
+  and rendering from those.
+
+### Tier 2 — mobile
+
+- **`layout.tsx` exports a `viewport` with `viewportFit: "cover"`**, without which
+  every `env(safe-area-inset-*)` resolves to 0 and the insets below do nothing.
+- **`ChatPanel` is a bottom sheet on mobile** (`max-h-[75dvh]`, rounded top, map
+  still visible above) and the full-height side panel from `md` up. `dvh` so it
+  tracks the collapsing toolbar, and `min-h-0` on the scroll container — without
+  it a flex child with `overflow-y-auto` refuses to shrink below content height
+  and pushes the input off screen.
+- **Safe-area insets** on the video PiP, end-call row, entry gate and map
+  overlays. The online pill and "Fit to people" hide on mobile while the sheet is
+  open, where they were previously hidden behind it.
+- **The map reserves the panel's width on desktop** via a single `--panel-w` token
+  shared by the panel, the reach card and the floating controls. Previously the
+  reach card centred on the full viewport and slid underneath the panel on any
+  window narrower than ~1030px.
+
+### Tier 3 — states and meaning
+
+- **Empty state**, distinguishing "still checking" from "confirmed nobody here".
+  On a fresh deployment nobody is ever online, so without this the first thirty
+  seconds were a blank map and a "0 online" pill, which reads as broken. Dismissable,
+  and the card reserves the height of the taller state so the copy change does not
+  resize it (measured: 169px → 214px before the fix).
+- **Connection lifecycle feedback.** The chat header went from a bare
+  "Connecting…" to a spinner then a status dot, with a one-shot ring when the
+  channel opens. That moment previously had no feedback at all.
+- **Dots coloured by distance band** (`lib/distance.ts`) rather than a hash of the
+  session id, which looked meaningful and was not. Bands rather than exact
+  distances, because both coordinates are already privacy-offset and a precise
+  figure would be a lie.
+- **Typing indicator** over the existing peer-to-peer channel, so it costs nothing
+  server-side and never enters the transcript. Only transitions are sent, and it
+  auto-expires because a peer closing the tab mid-sentence never sends "stopped".
+- **Notices are queued.** Teardown emits several in quick succession and the old
+  behaviour dropped all but the last.
 
 ## Phase 4 — Make it better
 
-**Not started.** No new feature has been built yet.
+Four features, each built to be demonstrable in a two-minute review.
+
+### Reach — a connection context card
+
+Accepting a connection previously just produced a chat panel; you learned nothing
+about who you were about to talk to. The card shows the distance band, an
+estimated local time, and a random conversation starter.
+
+- **Local time is estimated and labelled as such.** No timezone database and no
+  geocoding call — the app deliberately talks to no third party and stores nothing.
+  It is derived from longitude alone (`lng / 15` hours from UTC), so it ignores
+  latitude, timezone shape and DST. The UI says "roughly 3pm where they are"
+  rather than implying precision it does not have.
+- **Bands rather than exact distances**, for the same reason: both coordinates are
+  already privacy-offset, so a precise figure would be a lie *and* less private.
+- **Conversation starters are served entirely client-side** — no server round trip,
+  nothing stored, never repeated consecutively. A test asserts none of them asks
+  for age, exact location, contact details or handles, since the list is shown to
+  someone you just met.
+
+### Block — session-scoped, memory-only
+
+There was no way to avoid someone: only "End", and because you *can* reconnect you
+might reconnect to the same person.
+
+- **The scope is the interesting part.** Session ids are server-issued UUIDs
+  minted per page load and there are no accounts, so blocking a session id blocks
+  *that session*, not the person. On their next visit they get a new id and
+  nothing held can match it. That is a direct consequence of "no accounts, nothing
+  persists", not an oversight.
+- **Memory-only because persistence would be pointless.** A session-scoped list
+  stored in `localStorage` would hold identifiers that can never match again. It
+  would buy nothing and cost the privacy guarantee. Nothing touches disk and
+  nothing is sent to the server.
+- **Enforcement is client-side**, which is the correct model: blocking exists for
+  the blocker's benefit, not to constrain the blocked party. Refusing to dial and
+  auto-declining their requests covers both directions.
+- **Tapping a blocked dot unblocks it**, so it is never a one-way door. `end` is
+  the only signal type that still gets through from a blocked session, otherwise
+  blocking mid-call would strand the connection until the 20s deadline.
+- **Report was deliberately not built.** A report needs somewhere to go — a
+  moderation queue, an admin, a log. This app stores nothing and has no backend,
+  so a report button would be theatre that tells a user their report landed when
+  it did not.
+
+### Wave — a low-commitment greeting
+
+- **Architectural consequence:** there is no data channel before connecting, so a
+  wave cannot ride WebRTC. It travels through the server as a new `wave` signal
+  type in the same transient mailbox, discarded on read like every other signal.
+- **Sent by long-press (touch) or right-click (pointer)**, deliberately *not* on
+  tap — tap means connect, and that path is the core of the app and already
+  verified. Both gestures fire before a synthesised click, so suppressing the
+  default keeps tap intact.
+- **The reply stays as low-commitment as the greeting**: a bar with "Wave back" /
+  "Connect" / dismiss, no prompt and no busy lease.
+- **Verified that a wave consumes no busy lease**, which was the property that
+  would have made it harmful — waving at someone must not lock you both out of
+  connecting.
+
+### Live network status
+
+A stalled connection and a slow one look identical from the outside; both sit on
+"Connecting…" with no explanation, so the only available response is to guess or
+retry and hope.
+
+- **The mapping lives in `lib/netstatus.ts`** with 11 unit tests, deliberately
+  away from the component. Coverage includes that no failing state ever reads as
+  "ok", that all four progress states produce *distinct* copy, and that hints
+  stay under one sentence.
+- **On failure it distinguishes two causes that need opposite responses.** If
+  candidate gathering never completed or any STUN request errored, it says the
+  network may be blocking the route and suggests a VPN or different network. If
+  gathering completed cleanly but ICE still failed, it falls back to a generic
+  hint — blaming the network there would be a guess.
+- **A mid-call dropout never blames the network**, since the route demonstrably
+  worked once; that is what the sticky `everConnected` flag is for.
+
+### Phase 4 known limitations
+
+- **Block is session-scoped, not identity-scoped.** Durable blocking would
+  require stable identity, which the brief explicitly rules out. Worth stating as
+  an assumption rather than letting a reviewer infer durable blocking that is not
+  there.
+- **Unblocking is only reachable by finding the dot.** The count chip is a
+  non-interactive hint with no list and no clear-all.
+- **Live network status is only Medium demo-able** — it needs a bad network to
+  demonstrate. Force it by blocking a STUN domain locally, or test from a
+  restrictive network.
+- **The wave gestures are unverified in a browser.** The signalling is tested
+  (13 assertions); long-press timing and the contextmenu handler need a real
+  pointer.
 
 ## Engineering practice
 
