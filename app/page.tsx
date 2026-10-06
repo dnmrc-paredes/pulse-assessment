@@ -6,10 +6,18 @@ import WorldMap from "./components/WorldMap";
 import ConnectionPrompt from "./components/ConnectionPrompt";
 import ChatPanel, { type ChatMessage } from "./components/ChatPanel";
 import VideoPanel from "./components/VideoPanel";
-import { join, leave, poll, sendSignal } from "@/lib/api";
+import {
+  ApiError,
+  join,
+  leave,
+  poll,
+  sendSignal,
+  type SessionCredentials,
+} from "@/lib/api";
 import { PeerSession, type DescType, type PeerControl } from "@/lib/webrtc";
 import { POLL_INTERVAL_MS } from "@/lib/presence";
-import { type PeerDot, type SignalMsg } from "@/lib/types";
+import { type PeerDot, type SignalMsg, type SignalType } from "@/lib/types";
+import { trace, traceEvent } from "@/lib/debug";
 
 type Conn =
   | { kind: "idle" }
@@ -22,17 +30,47 @@ type VideoState = "none" | "requesting" | "incoming" | "active";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// How long an incoming request stays on screen. Without this the prompt could
+// sit forever while its server-side busy lease quietly aged out, leaving the UI
+// offering a connection the server would no longer honour.
+const INCOMING_TIMEOUT_MS = 30_000;
+
+// How long we wait for the data channel to open after both sides agreed to
+// connect. This is not optional: a peer that vanishes mid-handshake never
+// reaches `connected`, and without a deadline this tab would stay in
+// `connecting`, keep refreshing its own busy lease on every poll, and be
+// permanently unconnectable while showing "Connecting…".
+const CONNECT_TIMEOUT_MS = 20_000;
+
+// Cap on consecutive silent re-joins before we give up and show the gate. A 401
+// loop means something is structurally wrong, and retrying forever would spin.
+const MAX_AUTO_REJOINS = 3;
+
 export default function Home() {
   const [phase, setPhase] = useState<"gate" | "live">("gate");
-  const [sessionId] = useState(() => crypto.randomUUID());
+  const [session, setSession] = useState<SessionCredentials | null>(null);
   const [peers, setPeers] = useState<PeerDot[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [notice, setNotice] = useState<string | null>(null);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+
+  const sessionRef = useRef<SessionCredentials | null>(null);
+  const setSessionCreds = (c: SessionCredentials | null) => {
+    sessionRef.current = c;
+    setSession(c);
+  };
+
+  // Mirrors myLocation so async handlers (re-join) can read it without
+  // depending on a stale render closure.
   const [myLocation, setMyLocation] = useState<{ lat: number; lng: number } | null>(
     null,
   );
+  const myLocationRef = useRef<{ lat: number; lng: number } | null>(null);
+  const setLocation = (loc: { lat: number; lng: number } | null) => {
+    myLocationRef.current = loc;
+    setMyLocation(loc);
+  };
 
   const [conn, _setConn] = useState<Conn>({ kind: "idle" });
   const connRef = useRef<Conn>(conn);
@@ -50,11 +88,66 @@ export default function Home() {
 
   const peerRef = useRef<PeerSession | null>(null);
   const msgId = useRef(0);
-  const requestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const incomingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const noticeTimer = useRef<number | null>(null);
+  const rejoinsRef = useRef(0);
 
   function showNotice(text: string) {
     setNotice(text);
-    window.setTimeout(() => setNotice(null), 3500);
+    // Clear the previous dismissal first: overlapping notices used to race, so
+    // an earlier timer could hide a newer message early.
+    if (noticeTimer.current) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 3500);
+  }
+
+  // Every signal send funnels through here so failures are visible and auth is
+  // never silently skipped. Signals are addressed by recipient only — the
+  // server infers the sender from the session token, so there is no `fromId`
+  // to get wrong.
+  async function signal(toId: string, type: SignalType, payload?: string) {
+    const token = sessionRef.current?.token;
+    if (!token) return;
+    trace("->", type, undefined, toId, payload?.length);
+    try {
+      await sendSignal(token, toId, type, payload);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleSessionLost();
+      } else {
+        showNotice("Couldn't reach the server — check your connection.");
+      }
+    }
+  }
+
+  // The server no longer recognises this session, so it was reaped as stale.
+  // If we aren't mid-connection we can transparently mint a fresh identity;
+  // otherwise the connection is already unrecoverable, so surface it.
+  function handleSessionLost() {
+    if (connRef.current.kind !== "idle") {
+      teardown("Connection lost — reconnecting…");
+    }
+    if (rejoinsRef.current >= MAX_AUTO_REJOINS) {
+      setSessionCreds(null);
+      setPhase("gate");
+      showNotice("Session expired. Please re-enter.");
+      return;
+    }
+    rejoinsRef.current += 1;
+    const loc = myLocationRef.current;
+    if (!loc) {
+      setPhase("gate");
+      return;
+    }
+    void join(loc.lat, loc.lng)
+      .then((creds) => {
+        setSessionCreds(creds);
+        if (rejoinsRef.current > 0) showNotice("Reconnected.");
+      })
+      .catch(() => {
+        setSessionCreds(null);
+        setPhase("gate");
+      });
   }
 
   function addMessage(mine: boolean, text: string) {
@@ -62,7 +155,8 @@ export default function Home() {
   }
 
   function teardown(message?: string) {
-    if (requestTimer.current) clearTimeout(requestTimer.current);
+    if (connTimer.current) clearTimeout(connTimer.current);
+    if (incomingTimer.current) clearTimeout(incomingTimer.current);
     peerRef.current?.close();
     peerRef.current = null;
     setLocalStream(null);
@@ -73,20 +167,43 @@ export default function Home() {
     if (message) showNotice(message);
   }
 
+  // Deadline for the `connecting` state. A peer that disappears after both
+  // sides agreed never opens the channel and never reports `failed`, so this is
+  // the only thing that guarantees we stop refreshing a lease for a connection
+  // that is never going to exist.
+  function armConnectTimeout(peerId: string) {
+    traceEvent(`connect deadline armed for ${peerId}`);
+    if (connTimer.current) clearTimeout(connTimer.current);
+    connTimer.current = setTimeout(() => {
+      const c = connRef.current;
+      if (c.kind === "connecting" && c.peerId === peerId) {
+        traceEvent("CONNECT DEADLINE EXPIRED with", peerId);
+        void peerRef.current?.logCandidatePairs();
+        void signal(peerId, "end");
+        teardown("Couldn't establish the connection.");
+      }
+    }, CONNECT_TIMEOUT_MS);
+  }
+
   function startPeer(peerId: string, initiator: boolean) {
+    traceEvent(`PeerSession created initiator=${initiator} with ${peerId}`);
     const ps = new PeerSession(initiator, {
       onSignal: (type: DescType, payload: string) => {
-        void sendSignal(sessionId, peerId, type, payload);
+        void signal(peerId, type, payload);
       },
       onChat: (text) => addMessage(false, text),
       onControl: (ctrl) => handleControl(ctrl),
       onRemoteStream: (stream) => setRemoteStream(stream),
       onConnectionState: (state) => {
-        if (state === "failed") {
+        traceEvent("pc connectionState:", state);
+        if (state === "failed" || state === "closed") {
           teardown("Connection failed (network).");
         }
       },
       onChannelOpen: () => {
+        traceEvent("DATA CHANNEL OPEN with", peerId);
+        // The handshake completed, so the connect deadline no longer applies.
+        if (connTimer.current) clearTimeout(connTimer.current);
         setConn({ kind: "connected", peerId });
       },
     });
@@ -131,13 +248,15 @@ export default function Home() {
   function requestConnection(peerId: string) {
     if (connRef.current.kind !== "idle") return;
     setConn({ kind: "requesting", peerId });
-    void sendSignal(sessionId, peerId, "request");
-    requestTimer.current = setTimeout(() => {
+    void signal(peerId, "request");
+    connTimer.current = setTimeout(() => {
       if (
         connRef.current.kind === "requesting" &&
         connRef.current.peerId === peerId
       ) {
-        void sendSignal(sessionId, peerId, "end");
+        // Release our server-side busy lease, otherwise this attempt would
+        // keep both users locked out until the lease TTL expired.
+        void signal(peerId, "end");
         teardown("No answer.");
       }
     }, REQUEST_TIMEOUT_MS);
@@ -145,29 +264,41 @@ export default function Home() {
 
   function cancelRequest() {
     if (connRef.current.kind === "requesting") {
-      void sendSignal(sessionId, connRef.current.peerId, "end");
+      void signal(connRef.current.peerId, "end");
     }
     teardown();
   }
 
+  function expireIncoming(peerId: string) {
+    if (connRef.current.kind !== "incoming" || connRef.current.peerId !== peerId) {
+      return;
+    }
+    void signal(peerId, "end");
+    setConn({ kind: "idle" });
+    showNotice("Request expired.");
+  }
+
   function acceptIncoming() {
     if (connRef.current.kind !== "incoming") return;
+    if (incomingTimer.current) clearTimeout(incomingTimer.current);
     const peerId = connRef.current.peerId;
     startPeer(peerId, false);
-    void sendSignal(sessionId, peerId, "accept");
+    void signal(peerId, "accept");
     setConn({ kind: "connecting", peerId });
+    armConnectTimeout(peerId);
   }
 
   function declineIncoming() {
     if (connRef.current.kind !== "incoming") return;
-    void sendSignal(sessionId, connRef.current.peerId, "decline");
+    if (incomingTimer.current) clearTimeout(incomingTimer.current);
+    void signal(connRef.current.peerId, "decline");
     setConn({ kind: "idle" });
   }
 
   function endConnection() {
     const c = connRef.current;
     if (c.kind === "connecting" || c.kind === "connected") {
-      void sendSignal(sessionId, c.peerId, "end");
+      void signal(c.peerId, "end");
     }
     teardown();
   }
@@ -209,28 +340,36 @@ export default function Home() {
   }
 
   function processSignal(sig: SignalMsg) {
+    trace("<-", sig.type, sig.fromId, undefined, sig.payload?.length ?? 0);
     switch (sig.type) {
       case "request": {
         if (connRef.current.kind === "idle") {
           setConn({ kind: "incoming", peerId: sig.fromId });
+          // Bound how long the prompt can hold a busy lease server-side.
+          if (incomingTimer.current) clearTimeout(incomingTimer.current);
+          incomingTimer.current = setTimeout(
+            () => expireIncoming(sig.fromId),
+            INCOMING_TIMEOUT_MS,
+          );
         } else {
-          void sendSignal(sessionId, sig.fromId, "decline");
+          void signal(sig.fromId, "decline");
         }
         break;
       }
       case "accept": {
         const c = connRef.current;
         if (c.kind === "requesting" && c.peerId === sig.fromId) {
-          if (requestTimer.current) clearTimeout(requestTimer.current);
+          if (connTimer.current) clearTimeout(connTimer.current);
           startPeer(sig.fromId, true);
           setConn({ kind: "connecting", peerId: sig.fromId });
+          armConnectTimeout(sig.fromId);
         }
         break;
       }
       case "decline": {
         const c = connRef.current;
         if (c.kind === "requesting" && c.peerId === sig.fromId) {
-          if (requestTimer.current) clearTimeout(requestTimer.current);
+          if (connTimer.current) clearTimeout(connTimer.current);
           teardown("Request declined.");
         }
         break;
@@ -257,8 +396,12 @@ export default function Home() {
             c.kind === "connected") &&
           c.peerId === sig.fromId
         ) {
-          if (c.kind === "incoming") setConn({ kind: "idle" });
-          else teardown("Stranger disconnected.");
+          if (c.kind === "incoming") {
+            if (incomingTimer.current) clearTimeout(incomingTimer.current);
+            setConn({ kind: "idle" });
+          } else {
+            teardown("Stranger disconnected.");
+          }
         }
         break;
       }
@@ -270,18 +413,37 @@ export default function Home() {
     processSignalRef.current = processSignal;
   });
 
+  // Same pattern for the 401 handler: read it through a ref so the polling
+  // effect doesn't have to re-subscribe (and restart the loop) whenever the
+  // closure identity changes.
+  const handleSessionLostRef = useRef(handleSessionLost);
   useEffect(() => {
-    if (phase !== "live" || !sessionId) return;
+    handleSessionLostRef.current = handleSessionLost;
+  });
+
+  useEffect(() => {
+    const token = session?.token;
+    if (phase !== "live" || !token) return;
     let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const tick = async () => {
       try {
-        const data = await poll(sessionId);
+        // `active` reports whether we hold a live connection, which is what
+        // keeps our busy lease from being reclaimed mid-call.
+        const data = await poll(token, connRef.current.kind !== "idle");
         if (!active) return;
         setPeers(data.peers);
         for (const s of data.signals) processSignalRef.current(s);
-      } catch {}
+        rejoinsRef.current = 0;
+      } catch (err) {
+        if (!active) return;
+        if (err instanceof ApiError && err.status === 401) {
+          handleSessionLostRef.current();
+        }
+        // Other failures (offline, 5xx) are transient: back off one interval
+        // and retry rather than tearing down a working session.
+      }
       if (active) timer = setTimeout(tick, POLL_INTERVAL_MS);
     };
     tick();
@@ -290,23 +452,32 @@ export default function Home() {
       active = false;
       if (timer) clearTimeout(timer);
     };
-  }, [phase, sessionId]);
+  }, [phase, session?.token]);
 
   useEffect(() => {
-    if (!sessionId || phase !== "live") return;
-    const onLeave = () => leave(sessionId);
+    const token = session?.token;
+    if (!token || phase !== "live") return;
+    const onLeave = () => leave(token);
     window.addEventListener("pagehide", onLeave);
     window.addEventListener("beforeunload", onLeave);
     return () => {
       window.removeEventListener("pagehide", onLeave);
       window.removeEventListener("beforeunload", onLeave);
     };
-  }, [sessionId, phase]);
+  }, [session?.token, phase]);
 
   async function handleReady(lat: number, lng: number) {
-    setMyLocation({ lat, lng });
-    await join(sessionId, lat, lng);
-    setPhase("live");
+    setLocation({ lat, lng });
+    try {
+      const creds = await join(lat, lng);
+      rejoinsRef.current = 0;
+      setSessionCreds(creds);
+      setPhase("live");
+    } catch {
+      // Roll back so the gate stays usable; EntryGate renders the failure.
+      setLocation(null);
+      throw new Error("join failed");
+    }
   }
 
   if (phase === "gate") {

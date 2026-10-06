@@ -5,10 +5,22 @@ import { useState } from "react";
 export default function EntryGate({
   onReady,
 }: {
-  onReady: (lat: number, lng: number) => void;
+  onReady: (lat: number, lng: number) => void | Promise<void>;
 }) {
   const [status, setStatus] = useState<"idle" | "locating" | "error">("idle");
   const [error, setError] = useState<string>("");
+
+  // onReady can reject (e.g. the session could not be created), so it is
+  // awaited here — otherwise the failure would surface as an unhandled
+  // rejection and the button would spin on "Locating…" forever.
+  async function enterWith(lat: number, lng: number) {
+    try {
+      await onReady(lat, lng);
+    } catch {
+      setStatus("error");
+      setError("Couldn't start a session. Please try again.");
+    }
+  }
 
   function enter() {
     if (!("geolocation" in navigator)) {
@@ -17,8 +29,9 @@ export default function EntryGate({
       return;
     }
     setStatus("locating");
+    setError("");
     navigator.geolocation.getCurrentPosition(
-      (pos) => onReady(pos.coords.latitude, pos.coords.longitude),
+      (pos) => void enterWith(pos.coords.latitude, pos.coords.longitude),
       (err) => {
         setStatus("error");
         setError(
