@@ -1,8 +1,14 @@
 @import "tailwindcss";
 
+/* --panel-w is the width of the desktop conversation panel (previously
+   max-w-md). Defined once because three elements reserve space for it: the
+   panel itself, the reach card that centres in the map area beside it, and the
+   map's floating controls, which were being covered by it. */
 :root {
   --background: #ffffff;
   --foreground: #171717;
+
+  --panel-w: 28rem;
 }
 
 @theme inline {
@@ -73,6 +79,29 @@ body {
   opacity: 0.35;
 }
 
+/* Blocked peers read as unavailable rather than merely dimmed: desaturated,
+   struck through, and not a connect target. */
+.pulse-dot[data-blocked="true"] {
+  cursor: not-allowed;
+}
+
+.pulse-dot[data-blocked="true"]::after {
+  opacity: 0.5;
+  filter: grayscale(1);
+  position: relative;
+}
+
+.pulse-dot[data-blocked="true"]::before {
+  content: "";
+  position: absolute;
+  width: 22px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(255, 255, 255, 0.85);
+  transform: rotate(-45deg);
+  pointer-events: none;
+}
+
 /* The user's own "you are here" pin — drawn at the position the server
    published, not the raw GPS fix, so it matches what peers actually see. */
 .pulse-me {
@@ -96,6 +125,17 @@ body {
   padding: 0 5px;
   border-radius: 9999px;
   white-space: nowrap;
+}
+
+@keyframes reach-in {
+  from {
+    transform: translateY(-10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 
 @keyframes typing-bounce {
@@ -128,15 +168,39 @@ body {
   }
 }
 
-@keyframes pulse-breathe {
+@keyframes wave-ripple {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.9);
+  }
+  100% {
+    box-shadow: 0 0 0 22px rgba(52, 211, 153, 0);
+  }
+}
+
+@keyframes wave-send {
   0%,
   100% {
     transform: scale(1);
-    opacity: 0.85;
   }
   50% {
-    transform: scale(1.12);
+    transform: scale(1.45);
+  }
+}
+
+@keyframes wave-bar-in {
+  from {
+    transform: translateY(-12px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
     opacity: 1;
+  }
+}
+
+@keyframes pulse-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
@@ -155,8 +219,43 @@ body {
 /* Empty / loading state indicator on the map. The loader breathes while we are
    still checking; the idle state keeps a faint static halo so the card does not
    look broken once we know we are genuinely waiting for someone. */
+/* Wave ripple on a dot. Expanding rings read as "a signal arrived from here"
+   without needing the dot itself to move, which would disturb its position. */
+.pulse-dot[data-waved="true"]::after {
+  animation: wave-ripple 1.5s ease-out 2;
+}
+
+/* The 👋 badge sits above the dot so it is visible without resizing it. */
+.pulse-dot[data-waved="true"]::before {
+  content: "\1F44B";
+  position: absolute;
+  top: -14px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 15px;
+  line-height: 1;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
+}
+
+/* Confirmation on the sender's own dot. */
+.pulse-dot[data-waving="true"]::after {
+  animation: wave-send 0.6s ease-in-out 2;
+}
+
+/* The wave-back bar slides in from the top. */
+.wave-in {
+  animation: wave-bar-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Loading indicator: a 3/4 arc that rotates under no-preference motion, so the
+   open segment reads as "spinning" rather than "broken". */
 .pulse-loader {
   border-top-color: transparent;
+}
+
+/* Reach card entrance: settles down into place rather than popping. */
+.reach-in {
+  animation: reach-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 /* Three-dot typing indicator. */
@@ -199,7 +298,16 @@ body {
     animation: pulse-ring 2s ease-out infinite;
   }
   .pulse-loader {
-    animation: pulse-breathe 1.6s ease-in-out infinite;
+    animation: pulse-spin 1.2s linear infinite;
+  }
+  .pulse-dot[data-waved="true"]::after {
+    animation: wave-ripple 1.5s ease-out 2;
+  }
+  .pulse-dot[data-waving="true"]::after {
+    animation: wave-send 0.6s ease-in-out 2;
+  }
+  .wave-in {
+    animation: wave-bar-in 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
   }
   .conn-spinner {
     animation: conn-spin 0.7s linear infinite;
@@ -209,6 +317,9 @@ body {
   }
   .typing-dots i {
     animation: typing-bounce 1.2s ease-in-out infinite;
+  }
+  .reach-in {
+    animation: reach-in 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
   }
   .typing-dots i:nth-child(2) {
     animation-delay: 0.15s;
@@ -222,7 +333,10 @@ body {
    from the background, and drop the hover scale. */
 @media (prefers-reduced-motion: reduce) {
   .pulse-loader {
-    opacity: 0.6;
+    /* No rotation here, so the arc has to become a full ring — otherwise it is
+       a circle with a chunk missing and reads as a rendering fault. */
+    border-top-color: currentColor;
+    opacity: 0.7;
   }
   .pulse-dot::after {
     box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.35);

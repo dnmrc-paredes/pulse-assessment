@@ -4,13 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { Map as MapboxMap, Marker } from "mapbox-gl";
 import type { PeerDot } from "@/lib/types";
-import {
-  BAND_LABEL,
-  bandColor,
-  distanceBand,
-  haversineKm,
-  type DistanceBand,
-} from "@/lib/distance";
+import { BAND_LABEL, bandColor, type DistanceBand } from "@/lib/distance";
 
 // Read the token from the environment only — never hardcode a `pk.` value or
 // fall back to a placeholder. A placeholder looks like a real token to
@@ -40,42 +34,105 @@ export default function WorldMap({
   peers,
   me,
   onPeerClick,
+  onWave,
+  wavingPeerId = null,
   canConnect,
   compact = false,
   presenceState = "populated",
+  wavedPeerId = null,
+  bands,
+  blockedPeers = [],
 }: {
   peers: PeerDot[];
   me: { lat: number; lng: number } | null;
   onPeerClick: (id: string) => void;
+  onWave: (id: string) => void;
+  // Peer we just waved at, so the sender sees confirmation it left.
+  wavingPeerId?: string | null;
+  // Peer who waved at us: renders the ripple and a 👋 badge on their dot.
+  wavedPeerId?: string | null;
   canConnect: boolean;
   // True while a panel covers the lower half of the screen on mobile.
   compact?: boolean;
   // "loading" until the first poll returns, then "empty" or "populated". Kept
   // distinct so the app does not claim nobody is online before it has checked.
   presenceState?: "loading" | "empty" | "populated";
+  // Distance band per peer id. Computed by the parent so the dot colour, the
+  // reach card and the chat header cannot disagree about distance.
+  bands?: Map<string, DistanceBand>;
+  // Session ids the user has blocked. Dots are marked and tapping one unblocks.
+  blockedPeers?: readonly string[];
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapboxMap | null>(null);
   const markersRef = useRef<Map<string, Marker>>(new Map());
+  const blockedRef = useRef<readonly string[]>(blockedPeers);
+  useEffect(() => {
+    blockedRef.current = blockedPeers;
+  });
   const meMarkerRef = useRef<Marker | null>(null);
   const [ready, setReady] = useState(false);
+  // Dismissing the "nobody else is here" card sticks until reload. Re-showing
+  // it on every 1.5s poll would be nagging, and it reappears anyway the moment
+  // anyone joins, since that is a different state. Deliberately not persisted:
+  // this is a view preference, not user data.
+  const [emptyStateDismissed, setEmptyStateDismissed] = useState(false);
 
   // Marker click handlers are bound once, so read the live click handler +
   // connectability through refs (synced in an effect, never during render).
   const onPeerClickRef = useRef(onPeerClick);
+  const onWaveRef = useRef(onWave);
   const canConnectRef = useRef(canConnect);
   useEffect(() => {
     onPeerClickRef.current = onPeerClick;
+    onWaveRef.current = onWave;
     canConnectRef.current = canConnect;
   });
 
-  // Band a peer relative to our own published position. Without a known
-  // position every peer reads as "far", which would be misleading rather than
-  // merely unhelpful.
-  function describeBand(peer: PeerDot): DistanceBand {
-    const origin = meRef.current;
-    if (!origin) return "far";
-    return distanceBand(haversineKm(origin, { lat: peer.lat, lng: peer.lng }));
+  // A wave is sent by long-pressing (touch) or right-clicking (pointer).
+  // Deliberately NOT on tap: tap means connect, and that path is the core of
+  // the app and already verified. Long-press and contextmenu both fire before
+  // a synthesised click, so suppressing the default on them keeps tap intact.
+  const LONG_PRESS_MS = 480;
+  function attachWaveGestures(el: HTMLElement, peerId: string) {
+    let timer: number | null = null;
+    let fired = false;
+
+    const cancel = () => {
+      if (timer !== null) window.clearTimeout(timer);
+      timer = null;
+    };
+
+    el.addEventListener("pointerdown", (e) => {
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      fired = false;
+      cancel();
+      timer = window.setTimeout(() => {
+        fired = true;
+        onWaveRef.current(peerId);
+      }, LONG_PRESS_MS);
+    });
+    ["pointerup", "pointercancel", "pointerleave"].forEach((evt) =>
+      el.addEventListener(evt, cancel),
+    );
+    // Swallow the click that follows a completed long-press, otherwise the
+    // wave is immediately followed by a connection request.
+    el.addEventListener(
+      "click",
+      (e) => {
+        if (fired) {
+          e.stopPropagation();
+          e.preventDefault();
+          fired = false;
+        }
+      },
+      true,
+    );
+    el.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onWaveRef.current(peerId);
+    });
   }
 
   // Live mirrors of the props, so the viewport helpers below don't need to be
@@ -202,7 +259,10 @@ export default function WorldMap({
         el.title = "You are here";
         el.innerHTML = `<span class="pulse-me-label">Me</span>📍`;
         // anchor "bottom" → the pin's tip sits on the exact coordinate.
-        meMarkerRef.current = new mapboxgl.Marker({ element: el, anchor: "bottom" })
+        meMarkerRef.current = new mapboxgl.Marker({
+          element: el,
+          anchor: "bottom",
+        })
           .setLngLat([me.lng, me.lat])
           .addTo(map);
       } else {
@@ -230,7 +290,7 @@ export default function WorldMap({
       for (const peer of peers) {
         seen.add(peer.id);
         let marker = markers.get(peer.id);
-        const band = describeBand(peer);
+        const band = bands?.get(peer.id) ?? "far";
         if (!marker) {
           const el = document.createElement("button");
           el.className = "pulse-dot";
@@ -238,6 +298,7 @@ export default function WorldMap({
             e.stopPropagation();
             if (canConnectRef.current) onPeerClickRef.current(peer.id);
           });
+          attachWaveGestures(el, peer.id);
           marker = new mapboxgl.Marker({ element: el })
             .setLngLat([peer.lng, peer.lat])
             .addTo(map);
@@ -248,11 +309,22 @@ export default function WorldMap({
         // first markers are created — setting colour once at creation would
         // bake in the no-position fallback and never correct it.
         const el = marker.getElement();
+        const isBlocked = blockedRef.current.includes(peer.id);
         el.style.setProperty("--dot-color", dotColor(band));
-        el.title = `${BAND_LABEL[band]} — tap to connect`;
+        el.title = isBlocked
+          ? "Blocked — tap to unblock"
+          : `${BAND_LABEL[band]} — tap to connect`;
         // The dot is an icon-only control, so it needs an accessible name.
-        el.setAttribute("aria-label", `Connect to someone ${BAND_LABEL[band].toLowerCase()}`);
+        el.setAttribute(
+          "aria-label",
+          isBlocked
+            ? "This person is blocked. Activate to unblock."
+            : `Connect to someone ${BAND_LABEL[band].toLowerCase()}`,
+        );
         el.dataset.busy = peer.busy ? "true" : "false";
+        el.dataset.blocked = isBlocked ? "true" : "false";
+        el.dataset.waving = peer.id === wavingPeerId ? "true" : "false";
+        el.dataset.waved = peer.id === wavedPeerId ? "true" : "false";
       }
 
       // Drop markers for peers that went offline / got filtered out.
@@ -267,7 +339,7 @@ export default function WorldMap({
     return () => {
       cancelled = true;
     };
-  }, [peers, ready]);
+  }, [peers, ready, bands, blockedPeers, wavingPeerId, wavedPeerId]);
 
   return (
     <div className="absolute inset-0">
@@ -277,8 +349,8 @@ export default function WorldMap({
         <div className="absolute inset-0 flex items-center justify-center p-6 text-center">
           <p className="max-w-md rounded-lg bg-zinc-800 p-4 text-sm text-zinc-200">
             Set{" "}
-            <code className="text-emerald-400">NEXT_PUBLIC_MAPBOX_TOKEN</code> in{" "}
-            <code>.env</code> to load the map.
+            <code className="text-emerald-400">NEXT_PUBLIC_MAPBOX_TOKEN</code>{" "}
+            in <code>.env</code> to load the map.
           </p>
         </div>
       )}
@@ -291,42 +363,63 @@ export default function WorldMap({
           distinguished: showing "nobody here yet" before the first poll returns
           would be a lie, and would flicker.
           aria-live because this is genuinely status information. */}
-      {!MISSING_TOKEN && presenceState !== "populated" && (
-        <div
-          className="pointer-events-none absolute inset-0 flex items-center justify-center px-6"
-          style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
-          role="status"
-          aria-live="polite"
-        >
-          <div className="max-w-xs rounded-2xl border border-zinc-800 bg-zinc-950/85 px-6 py-7 text-center backdrop-blur-sm">
-            <div
-              aria-hidden="true"
-              className={`mx-auto mb-4 h-10 w-10 rounded-full border-2 border-emerald-400/70 ${
-                presenceState === "loading" ? "pulse-loader" : "pulse-idle"
-              }`}
-            />
-            <p className="font-semibold text-zinc-100">
-              {presenceState === "loading"
-                ? "Finding people near you"
-                : "Nobody else is here yet"}
-            </p>
-            <p className="mt-2 text-sm leading-relaxed text-zinc-400">
-              {presenceState === "loading" ? (
-                <>One moment — checking who&rsquo;s around.</>
-              ) : (
-                <>
-                  You&rsquo;re on the map. Keep this tab open and you&rsquo;ll
-                  appear as soon as someone else joins.
-                </>
-              )}
-            </p>
+      {!MISSING_TOKEN &&
+        presenceState !== "populated" &&
+        !emptyStateDismissed && (
+          <div
+            className="pointer-events-none absolute inset-0 flex items-center justify-center px-6"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+            role="status"
+            aria-live="polite"
+          >
+            {/* pointer-events-auto is scoped to the card: the surrounding overlay
+              must stay click-through so the map can still be panned and zoomed
+              while this is up. */}
+            {/* min-h reserves the height of the taller of the two states so the
+              card does not resize when "loading" becomes "nobody else is here
+              yet" — the copy differs by two lines, and because the card is
+              vertically centred it previously grew in both directions, moving
+              the heading and the ring with it. Measured: 169px -> 214px.
+              flex + justify-center keeps the content centred in the reserved
+              box so the shorter state simply has more breathing room. */}
+            <div className="pointer-events-auto relative flex min-h-[14rem] max-w-xs flex-col justify-center rounded-2xl border border-zinc-800 bg-zinc-950/85 px-6 py-7 text-center backdrop-blur-sm">
+              <button
+                type="button"
+                onClick={() => setEmptyStateDismissed(true)}
+                aria-label="Dismiss — you are the only one here"
+                title="Dismiss"
+                className="absolute -right-2 -top-2 flex h-8 w-8 items-center justify-center rounded-full border border-zinc-700 bg-zinc-900 text-zinc-400 transition hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                <span aria-hidden="true">&times;</span>
+              </button>
+              <div
+                aria-hidden="true"
+                className={`mx-auto mb-4 h-10 w-10 rounded-full border-2 border-emerald-400/70 ${
+                  presenceState === "loading" ? "pulse-loader" : "pulse-idle"
+                }`}
+              />
+              <p className="font-semibold text-zinc-100">
+                {presenceState === "loading"
+                  ? "Finding people near you"
+                  : "Nobody else is here yet"}
+              </p>
+              <p className="mt-2 text-sm leading-relaxed text-zinc-400">
+                {presenceState === "loading" ? (
+                  <>One moment — checking who&rsquo;s around.</>
+                ) : (
+                  <>
+                    You&rsquo;re on the map. Keep this tab open and you&rsquo;ll
+                    appear as soon as someone else joins.
+                  </>
+                )}
+              </p>
+            </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Online count. Lifted above the home indicator, and hidden on mobile
-          while the conversation sheet is open (the parent tells us via
-          `compact`) so it does not sit behind the sheet. */}
+      {/* Online count. Anchored left, so it never collides with the desktop
+          panel on the right. Lifted above the home indicator, and hidden on
+          mobile while the sheet is open. */}
       <div
         className={`absolute left-4 rounded-full bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-300 backdrop-blur ${
           compact ? "hidden md:block" : ""
@@ -336,6 +429,30 @@ export default function WorldMap({
         {peers.length} online
       </div>
 
+      {/* Discoverability hint. Long-press and right-click are not obvious on
+          their own, and the wave is the only feature that uses them. */}
+      {peers.length > 0 && !MISSING_TOKEN && !compact && (
+        <div className="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-zinc-900/70 px-3 py-1 text-[11px] text-zinc-500 backdrop-blur">
+          Tap to connect &middot; hold a dot to wave
+        </div>
+      )}
+
+      {/* Blocked count. Only rendered when non-empty; the per-dot state plus
+          tap-to-unblock is the actual affordance, this just makes the list
+          discoverable. */}
+      {blockedPeers.length > 0 && !MISSING_TOKEN && (
+        <div
+          className={`absolute left-4 rounded-full bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-400 backdrop-blur ${
+            compact ? "hidden md:block" : ""
+          }`}
+          style={{
+            bottom: "max(3.25rem, calc(env(safe-area-inset-bottom) + 3.25rem))",
+          }}
+        >
+          {blockedPeers.length} blocked — tap the dot to unblock
+        </div>
+      )}
+
       {/* Manual re-frame. Auto-fit deliberately runs only once, so this is how
           you get the "where is everyone" view back after panning away. */}
       {!MISSING_TOKEN && peers.length > 0 && (
@@ -343,7 +460,12 @@ export default function WorldMap({
           type="button"
           onClick={() => void fitToPeers()}
           className={`absolute right-4 rounded-full bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-300 backdrop-blur transition hover:bg-zinc-800 hover:text-zinc-100 ${
-            compact ? "hidden md:block" : ""
+            compact
+              ? // Shifts clear of the desktop panel, which is showing and would
+                // otherwise cover it. Hidden entirely on mobile, where the
+                // sheet is at the bottom instead.
+                "hidden md:right-[calc(var(--panel-w)+1rem)] md:block"
+              : ""
           }`}
           style={{ bottom: "max(1rem, env(safe-area-inset-bottom))" }}
         >

@@ -9,6 +9,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const VALID_TYPES: readonly SignalType[] = [
+  "wave",
   "request",
   "accept",
   "decline",
