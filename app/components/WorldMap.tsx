@@ -1,11 +1,25 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "mapbox-gl/dist/mapbox-gl.css";
 import type { Map as MapboxMap, Marker } from "mapbox-gl";
 import type { PeerDot } from "@/lib/types";
 
-const TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN ?? "pk.eyJ1IjoicHVsc2UtbWFwIiwiYSI6ImNrMDBkZW1vMDAwMDAwMDAifQ.AAAAAAAAAAAAAAAAAAAAAA";
+// Read the token from the environment only — never hardcode a `pk.` value or
+// fall back to a placeholder. A placeholder looks like a real token to
+// Mapbox's own checks, so the map fails closed as a blank canvas with no error
+// instead of reaching the "set NEXT_PUBLIC_MAPBOX_TOKEN" state below.
+const TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+
+const MISSING_TOKEN = !TOKEN || TOKEN.startsWith("pk.your_");
+
+// Viewport clamping for auto-fit. maxZoom stops a single nearby peer from
+// slamming the camera to street level; minZoom stops a globally-spread peer
+// set from zooming out to a featureless globe.
+const FIT_PADDING = 72;
+const FIT_MAX_ZOOM = 11;
+const FIT_MIN_ZOOM = 1;
+const FIT_DURATION_MS = 700;
 
 function dotColor(id: string): string {
   let hash = 0;
@@ -41,9 +55,64 @@ export default function WorldMap({
     canConnectRef.current = canConnect;
   });
 
+  // Live mirrors of the props, so the viewport helpers below don't need to be
+  // rebuilt (and re-triggered) every time a peer list changes.
+  const peersRef = useRef(peers);
+  const meRef = useRef(me);
+  // Set once the camera has framed the user *and* at least one peer. After
+  // that the viewport belongs to the user — otherwise every peer join/leave
+  // would yank the map out from under them mid-pan.
+  const hasFittedRef = useRef(false);
+
+  useEffect(() => {
+    peersRef.current = peers;
+    meRef.current = me;
+  });
+
+  const fitToPeers = useCallback(async () => {
+    const map = mapRef.current;
+    if (!map) return;
+    const mapboxgl = (await import("mapbox-gl")).default;
+
+    const points: [number, number][] = [];
+    const mePoint = meRef.current;
+    if (mePoint) points.push([mePoint.lng, mePoint.lat]);
+    for (const p of peersRef.current) points.push([p.lng, p.lat]);
+
+    if (points.length === 0) return;
+    if (points.length === 1) {
+      map.easeTo({ center: points[0], zoom: 6, duration: FIT_DURATION_MS });
+      return;
+    }
+    const bounds = new mapboxgl.LngLatBounds();
+    for (const pt of points) bounds.extend(pt);
+    map.fitBounds(bounds, {
+      padding: FIT_PADDING,
+      maxZoom: FIT_MAX_ZOOM,
+      minZoom: FIT_MIN_ZOOM,
+      duration: FIT_DURATION_MS,
+    });
+  }, []);
+
+  // Frame the user and their peers the first time anyone shows up. Without
+  // this, two people on opposite sides of the planet are simply unreachable:
+  // the map opens centred on you at zoom 4, and a peer 1850km away sits
+  // roughly 1300px outside the viewport with no way to know they exist.
+  useEffect(() => {
+    if (!ready || hasFittedRef.current || peers.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      if (!cancelled) await fitToPeers();
+      hasFittedRef.current = true;
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [ready, peers.length, fitToPeers]);
+
   // Initialise the map once.
   useEffect(() => {
-    if (!TOKEN || !containerRef.current) return;
+    if (MISSING_TOKEN || !containerRef.current) return;
     let cancelled = false;
     const markers = markersRef.current;
 
@@ -60,7 +129,12 @@ export default function WorldMap({
         attributionControl: true,
       });
       map.on("load", () => {
-        if (!cancelled) setReady(true);
+        if (!cancelled) {
+          // A fresh map starts un-fitted, so the first peer to appear frames
+          // the view again (relevant when the map is torn down and remounted).
+          hasFittedRef.current = false;
+          setReady(true);
+        }
       });
       mapRef.current = map;
     })();
@@ -157,7 +231,7 @@ export default function WorldMap({
     <div className="absolute inset-0">
       <div ref={containerRef} className="h-full w-full bg-zinc-900" />
 
-      {!TOKEN && (
+      {MISSING_TOKEN && (
         <div className="absolute inset-0 flex items-center justify-center p-6 text-center">
           <p className="max-w-md rounded-lg bg-zinc-800 p-4 text-sm text-zinc-200">
             Set{" "}
@@ -171,6 +245,18 @@ export default function WorldMap({
       <div className="absolute bottom-4 left-4 rounded-full bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-300 backdrop-blur">
         {peers.length} online
       </div>
+
+      {/* Manual re-frame. Auto-fit deliberately runs only once, so this is how
+          you get the "where is everyone" view back after panning away. */}
+      {!MISSING_TOKEN && peers.length > 0 && (
+        <button
+          type="button"
+          onClick={() => void fitToPeers()}
+          className="absolute bottom-4 right-4 rounded-full bg-zinc-900/80 px-3 py-1.5 text-xs text-zinc-300 backdrop-blur transition hover:bg-zinc-800 hover:text-zinc-100"
+        >
+          Fit to people
+        </button>
+      )}
     </div>
   );
 }
