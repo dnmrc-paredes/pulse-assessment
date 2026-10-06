@@ -32,4 +32,8 @@ export interface SignalMsg {
 export interface PollResponse {
   peers: PeerDot[];
   signals: SignalMsg[];
+  // The caller's own published position (already privacy-offset server-side).
+  // Returned so the client can place its own "Me" marker where peers see it,
+  // instead of at its raw GPS coordinates.
+  me: { lat: number; lng: number } | null;
 }

@@ -104,6 +104,7 @@ export async function GET(request: NextRequest) {
 
   const response: PollResponse = {
     peers,
+    me: { lat: session.lat, lng: session.lng },
     signals: inbox.map((s) => ({
       id: s.id,
       fromId: s.fromId,
